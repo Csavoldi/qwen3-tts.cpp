@@ -43,9 +43,29 @@ Segment fault with a community 1.7B Base GGUF (`Serveurperso/Qwen3-TTS-GGUF`,
 #11 qwen3_tts::Qwen3TTS::synthesize_with_voice(...)
 ```
 
-That crash is addressed separately in this fork: the speaker encoder is now
-validated at load time and reports the missing tensors instead of dereferencing
-them. The *generation* problem below is untouched by that fix.
+### Status of that crash
+
+Two distinct causes were found and are addressed in this fork:
+
+1. **Metadata key names differ between converters.** The in-repo converter writes
+   `qwen3-tts.speaker_encoder.embedding_length`; community files write
+   `qwen3-tts.spk_enc.embedding_length`. Reading only the first silently fell back
+   to the 0.6B default (`1024`) for a 2048-wide file, and the mismatch aborted
+   inside `ggml_reshape_1d`. The encoder now reads both spellings.
+2. **Mixed weight types inside the encoder.** That file ships
+   `spk_enc.fc.weight` as **F32** while the other thirteen encoder weights are
+   F16. GGML's CPU backend aborts when the F32 weight meets F16 activations. The
+   loader now warns about the mix and `apply_conv1d` promotes the activations to
+   F32 for that layer.
+
+With both fixes the file loads and reaches synthesis instead of dying in the
+encoder, but it still aborts, now inside `ggml_compute_forward_im2col`
+(`ggml_conv_1d` → im2col → `ggml_abort`) during the encoder graph. That is a
+GGML-level limitation for this particular conversion, not something this fork
+works around. Re-converting the checkpoint with `scripts/convert_tts_to_gguf.py`
+(which keeps the encoder uniform) avoids it entirely — the in-repo conversion of
+the same checkpoint runs, it just hits the generation problem below.
+
 
 ## Ruled out
 

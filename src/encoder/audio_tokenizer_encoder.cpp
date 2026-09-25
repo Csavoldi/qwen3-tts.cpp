@@ -375,6 +375,46 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
             }
             return fail_load(message);
         }
+
+        // Mixed weight types no longer break the graph (apply_conv1d casts the
+        // activations), but they cost a per-layer cast and usually mean the file
+        // was converted inconsistently, so say so once at load time.
+        {
+            std::vector<const char *> f32_names;
+            int n_f32 = 0;
+            int n_other = 0;
+            auto note_type = [&](const struct ggml_tensor * tensor, const char * name) {
+                if (tensor == nullptr) {
+                    return;
+                }
+                if (tensor->type == GGML_TYPE_F32) {
+                    ++n_f32;
+                    f32_names.push_back(name);
+                } else {
+                    ++n_other;
+                }
+            };
+            note_type(model_.conv0_w, "spk_enc.conv0.weight");
+            note_type(model_.mfa_w, "spk_enc.mfa.weight");
+            note_type(model_.asp_conv_w, "spk_enc.asp.conv.weight");
+            note_type(model_.asp_tdnn_w, "spk_enc.asp.tdnn.weight");
+            note_type(model_.fc_w, "spk_enc.fc.weight");
+            for (int blk = 0; blk < 3; ++blk) {
+                note_type(model_.blocks[blk].tdnn1_w, "spk_enc.blk.*.tdnn1.weight");
+                note_type(model_.blocks[blk].tdnn2_w, "spk_enc.blk.*.tdnn2.weight");
+                note_type(model_.blocks[blk].res2net_w[0], "spk_enc.blk.*.res2net.*.weight");
+            }
+            if (n_f32 > 0 && n_other > 0) {
+                fprintf(stderr,
+                        "  Warning: speaker encoder weight types are mixed (%d F32 vs %d non-F32); "
+                        "converting to a single precision would avoid per-layer casts. F32 weights: ",
+                        n_f32, n_other);
+                for (size_t i = 0; i < f32_names.size() && i < 4; ++i) {
+                    fprintf(stderr, "%s%s", i > 0 ? ", " : "", f32_names[i]);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
     }
 
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx, 
@@ -571,6 +611,18 @@ static struct ggml_tensor * apply_conv1d(struct ggml_context * ctx,
         input = apply_reflect_pad_1d(ctx, x, pad);
         actual_pad = 0;
     }
+
+    // GGML's CPU backend aborts when an F32 weight meets F16 activations, and a
+    // community 1.7B conversion ships exactly that (spk_enc.fc.weight in F32 while
+    // the rest of the encoder is F16). Promote the activations to F32 for this
+    // layer only. Deliberately narrow: casting the other direction would push
+    // activations down to F16 and change behaviour for every model, and
+    // quantized weights need no help at all (ggml_conv_1d handles a quantized
+    // weight against F32 activations).
+    if (w != nullptr && input != nullptr &&
+        w->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F16) {
+        input = ggml_cast(ctx, input, GGML_TYPE_F32);
+    }
     
     struct ggml_tensor * y = ggml_conv_1d(ctx, w, input, stride, actual_pad, dilation);
     if (debug_name) {
@@ -580,6 +632,11 @@ static struct ggml_tensor * apply_conv1d(struct ggml_context * ctx,
     }
     if (b) {
         int64_t oc = y->ne[1];
+        // Same rule for the bias: promote activations rather than demote a
+        // higher-precision bias.
+        if (b->type == GGML_TYPE_F32 && y->type == GGML_TYPE_F16) {
+            y = ggml_cast(ctx, y, GGML_TYPE_F32);
+        }
         y = ggml_add(ctx, y, ggml_reshape_3d(ctx, b, 1, oc, 1));
     }
     return y;
