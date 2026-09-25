@@ -34,6 +34,40 @@ N_THREADS = int(os.environ.get("QWEN3TTS_THREADS", "4"))
 ICL_CACHE_SIZE = int(os.environ.get("QWEN3TTS_ICL_CACHE_SIZE", "8"))
 DEFAULT_LANGUAGE_ID = 2050
 
+# Pin one GPU before any backend initializes. GGML's Vulkan backend enumerates
+# every GPU in the box and the scheduler takes the first usable one, so on a
+# mixed-vendor machine (tested here: Tesla V100 + Radeon RX 7800 XT) synthesis
+# silently ran on the card the operator did not mean. CUDA_VISIBLE_DEVICES is set
+# as well so the setting means the same thing on a CUDA build.
+DEVICE_INDEX = os.environ.get("QWEN3TTS_DEVICE_INDEX", "").strip()
+if DEVICE_INDEX:
+    os.environ["GGML_VK_VISIBLE_DEVICES"] = DEVICE_INDEX
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", DEVICE_INDEX)
+
+# Optional sampling-temperature override. The request path still maps `speed`
+# onto temperature; this only replaces the default that a caller gets when it
+# does not ask for anything specific.
+_TEMPERATURE_OVERRIDE = os.environ.get("QWEN3TTS_TEMPERATURE", "").strip()
+DEFAULT_TEMPERATURE = float(_TEMPERATURE_OVERRIDE) if _TEMPERATURE_OVERRIDE else None
+
+# Upper bound on generated audio frames for one request. 0 means "derive from the
+# input length": the pipeline default is 2048 frames (~164s at 12.5 frames/s) and
+# a degenerate decode really does run to that cap, which is minutes of audio and
+# minutes of GPU time for a single sentence. Set a positive value to force a
+# fixed cap instead.
+MAX_AUDIO_TOKENS = int(os.environ.get("QWEN3TTS_MAX_AUDIO_TOKENS", "0"))
+
+
+def resolve_max_audio_tokens(text: str) -> int:
+    """Bound generation by the input length unless a fixed cap was configured."""
+    if MAX_AUDIO_TOKENS > 0:
+        return MAX_AUDIO_TOKENS
+    # This model speaks at roughly 12-17 characters per second and the tokenizer
+    # emits 12.5 frames per second, so frames ~= characters. Allow 2x for headroom.
+    return min(2048, max(64, 2 * len(text.strip())))
+
+
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
@@ -145,6 +179,9 @@ class SpeechRequest(BaseModel):
     voice: str = "default"
     response_format: str = "wav"
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    # Optional explicit sampling temperature; 0 = greedy. When omitted, the
+    # server default below applies for speed == 1.0.
+    temperature: float | None = None
 
     # ICL voice cloning: supply a path to a reference WAV on the server's
     # filesystem together with its transcript. When both are set, the request
@@ -165,8 +202,18 @@ async def create_speech(request: SpeechRequest):
     if request.response_format != "wav":
         raise HTTPException(status_code=400, detail={"error": {"message": f"Unsupported format '{request.response_format}'. Only 'wav' is supported.", "type": "invalid_request_error"}})
 
-    # Map speed to temperature: speed=1.0 → temp=0.9, speed=2.0 → temp=0.45
-    temperature = min(2.0, max(0.1, 0.9 / request.speed))
+    # Map speed to temperature: speed=1.0 → temp=0.9, speed=2.0 → temp=0.45.
+    # A caller can override per request; QWEN3TTS_TEMPERATURE replaces the default
+    # for speed == 1.0 (sampled decoding can ramble with the preset voices:
+    # measured 179 chars -> 37.5s at temp 0.9 versus 16.5s greedy).
+    if request.temperature is not None:
+        temperature = min(2.0, max(0.0, request.temperature))
+    elif request.speed == 1.0 and DEFAULT_TEMPERATURE is not None:
+        temperature = min(2.0, max(0.0, DEFAULT_TEMPERATURE))
+    else:
+        temperature = min(2.0, max(0.1, 0.9 / request.speed))
+
+    max_audio_tokens = resolve_max_audio_tokens(request.input)
 
     # ICL path: both reference_audio_path and reference_text provided.
     icl_ref_audio = (request.reference_audio_path or "").strip()
@@ -229,15 +276,18 @@ async def create_speech(request: SpeechRequest):
                 if kind == "default":
                     return tts_engine.synthesize(
                         request.input, temperature=temperature,
+                        max_audio_tokens=max_audio_tokens,
                     )
                 if kind == "json":
                     embedding = voice_embeddings[resolved]
                     return tts_engine.synthesize_with_embedding(
                         request.input, embedding, temperature=temperature,
+                        max_audio_tokens=max_audio_tokens,
                     )
                 # kind == "preset"
                 return tts_engine.synthesize_with_preset(
                     request.input, resolved, temperature=temperature,
+                    max_audio_tokens=max_audio_tokens,
                 )
 
         loop = asyncio.get_event_loop()
@@ -268,7 +318,14 @@ async def list_voices():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model_loaded": tts_engine is not None}
+    return {
+        "status": "ok",
+        "model_loaded": tts_engine is not None,
+        "model_dir": MODEL_DIR,
+        "device_index": DEVICE_INDEX or None,
+        "max_audio_tokens": MAX_AUDIO_TOKENS or "derived-from-input",
+        "default_temperature": DEFAULT_TEMPERATURE,
+    }
 
 
 # ---------------------------------------------------------------------------

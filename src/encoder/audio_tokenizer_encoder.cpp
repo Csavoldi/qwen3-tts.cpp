@@ -165,8 +165,31 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
         return fail_load(loader.get_error());
     }
     
-    model_.config.sample_rate = loader.get_u32("qwen3-tts.speaker_encoder.sample_rate", 24000);
-    model_.config.embedding_dim = loader.get_u32("qwen3-tts.speaker_encoder.embedding_length", 1024);
+    // Metadata key names differ between converters: the in-repo converter writes
+    // `qwen3-tts.speaker_encoder.*` while community GGUFs (for example the
+    // Serveurperso conversion) write `qwen3-tts.spk_enc.*`. Reading only one
+    // spelling silently fell back to the 0.6B default of embedding_dim=1024 for a
+    // 1.7B file whose tensors are 2048 wide, and the mismatch aborted inside
+    // ggml_reshape_1d during the first encode. Accept both.
+    auto get_u32_alias = [&loader](std::initializer_list<const char *> keys,
+                                   int32_t default_val) -> int32_t {
+        for (const char * key : keys) {
+            const int32_t value = loader.get_u32(key, 0);
+            if (value != 0) {
+                return value;
+            }
+        }
+        return default_val;
+    };
+
+    model_.config.sample_rate = get_u32_alias({
+        "qwen3-tts.speaker_encoder.sample_rate",
+        "qwen3-tts.spk_enc.sample_rate",
+    }, 24000);
+    model_.config.embedding_dim = get_u32_alias({
+        "qwen3-tts.speaker_encoder.embedding_length",
+        "qwen3-tts.spk_enc.embedding_length",
+    }, 1024);
     
     int64_t n_tensors = loader.get_n_tensors();
     int spk_tensor_count = 0;
@@ -260,7 +283,100 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
             }
         }
     }
-    
+
+    // Validate the full ECAPA-TDNN topology before anything runs. A GGUF can
+    // carry *some* spk_enc.* tensors but not all — community conversions differ
+    // (e.g. a 1.7B Base conversion that ships conv0/mfa/asp but no blocks) — and
+    // the old code only counted the tensors, so the first synthesis dereferenced
+    // a null weight and died with SIGSEGV deep inside the forward pass. Name the
+    // missing tensors instead: a clear load-time error beats a crash.
+    {
+        std::vector<std::string> missing;
+        auto require = [&missing](const struct ggml_tensor * tensor, const std::string & name) {
+            if (tensor == nullptr) {
+                missing.push_back(name);
+            }
+        };
+
+        require(model_.conv0_w, "spk_enc.conv0.weight");
+        require(model_.conv0_b, "spk_enc.conv0.bias");
+        require(model_.mfa_w, "spk_enc.mfa.weight");
+        require(model_.mfa_b, "spk_enc.mfa.bias");
+        require(model_.asp_conv_w, "spk_enc.asp.conv.weight");
+        require(model_.asp_conv_b, "spk_enc.asp.conv.bias");
+        require(model_.asp_tdnn_w, "spk_enc.asp.tdnn.weight");
+        require(model_.asp_tdnn_b, "spk_enc.asp.tdnn.bias");
+        require(model_.fc_w, "spk_enc.fc.weight");
+        require(model_.fc_b, "spk_enc.fc.bias");
+
+        for (int blk = 1; blk <= 3; ++blk) {
+            const std::string base = "spk_enc.blk." + std::to_string(blk) + ".";
+            const res2net_block & block = model_.blocks[blk - 1];
+            require(block.tdnn1_w, base + "tdnn1.weight");
+            require(block.tdnn1_b, base + "tdnn1.bias");
+            require(block.tdnn2_w, base + "tdnn2.weight");
+            require(block.tdnn2_b, base + "tdnn2.bias");
+            require(block.se_conv1_w, base + "se.conv1.weight");
+            require(block.se_conv1_b, base + "se.conv1.bias");
+            require(block.se_conv2_w, base + "se.conv2.weight");
+            require(block.se_conv2_b, base + "se.conv2.bias");
+            for (int branch = 0; branch < 7; ++branch) {
+                const std::string res = base + "res2net." + std::to_string(branch) + ".";
+                require(block.res2net_w[branch], res + "weight");
+                require(block.res2net_b[branch], res + "bias");
+            }
+        }
+
+        if (!missing.empty()) {
+            std::string message = "Speaker encoder is incomplete - " +
+                                  std::to_string(missing.size()) +
+                                  " required tensor(s) missing: ";
+            for (size_t i = 0; i < missing.size(); ++i) {
+                if (i > 0) {
+                    message += ", ";
+                }
+                if (i == 8) {
+                    message += "...";
+                    break;
+                }
+                message += missing[i];
+            }
+            return fail_load(message);
+        }
+
+        // Metadata and tensors can also disagree (mixed converter versions, or a
+        // file whose spk_enc.* keys were not understood). Check the two shapes the
+        // graph depends on, so the mismatch surfaces as a load error instead of a
+        // GGML abort in ggml_reshape_1d on the first encode — the failure mode
+        // that a community 1.7B GGUF used to trigger.
+        std::vector<std::string> mismatched;
+        auto require_elements = [&mismatched](const struct ggml_tensor * tensor,
+                                              int64_t expected,
+                                              const std::string & name) {
+            if (tensor != nullptr && ggml_nelements(tensor) != expected) {
+                mismatched.push_back(name + " (" + std::to_string(ggml_nelements(tensor)) +
+                                     " elements, expected " + std::to_string(expected) + ")");
+            }
+        };
+        require_elements(model_.fc_w,
+                         (int64_t)3072 * model_.config.embedding_dim,
+                         "spk_enc.fc.weight");
+        require_elements(model_.conv0_w,
+                         (int64_t)5 * 128 * model_.config.hidden_dim,
+                         "spk_enc.conv0.weight");
+        if (!mismatched.empty()) {
+            std::string message = "Speaker encoder tensors disagree with the model metadata (" +
+                                  std::to_string(mismatched.size()) + "): ";
+            for (size_t i = 0; i < mismatched.size() && i < 4; ++i) {
+                if (i > 0) {
+                    message += ", ";
+                }
+                message += mismatched[i];
+            }
+            return fail_load(message);
+        }
+    }
+
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx, 
                                      model_.tensors, model_.buffer, error_msg_)) {
         return fail_load(error_msg_);

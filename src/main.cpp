@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "ggml-backend.h"
+
 namespace {
 
 std::string basename_of(const std::string & path) {
@@ -115,7 +117,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
-    fprintf(stderr, "  --max-tokens <n>       Maximum audio tokens (default: 2048, ~170s @ 12Hz)\n");
+    fprintf(stderr, "  --max-tokens <n>       Maximum audio tokens (default: derived from text length, capped at 2048)\n");
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
     fprintf(stderr, "  --seed <n>             RNG seed for reproducible output (default: random)\n");
     fprintf(stderr, "  --no-f32-acc           Disable f32 matmul accumulation (faster, less precise)\n");
@@ -123,6 +125,8 @@ void print_usage(const char * program) {
     fprintf(stderr, "  --speaker <name>       Use a built-in preset voice (CustomVoice models only)\n");
     fprintf(stderr, "  --list-speakers        List preset voices available in the loaded model and exit\n");
     fprintf(stderr, "  --ref-text <text>      Reference transcript (with -r) for ICL voice cloning\n");
+    fprintf(stderr, "  --list-devices         List GGML devices with their indices and exit\n");
+    fprintf(stderr, "  --device-index <n>     Pin one GPU (sets GGML_VK_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES)\n");
     fprintf(stderr, "  --benchmark-json <file> Write structured benchmark JSON after synthesis\n");
     fprintf(stderr, "  --quiet-progress       Suppress CLI progress/status/timing output for benchmark runs\n");
     fprintf(stderr, "  -l, --language <lang>  Language: en,ru,zh,ja,ko,de,fr,es (default: en)\n");
@@ -156,6 +160,9 @@ int main(int argc, char ** argv) {
     std::string ref_text;
     std::string benchmark_json_file;
     bool quiet_progress = false;
+    bool max_tokens_explicit = false;
+    bool list_devices = false;
+    std::string device_index_arg;
     
     qwen3_tts::tts_params params;
     
@@ -260,6 +267,23 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             params.max_audio_tokens = std::stoi(argv[i]);
+            max_tokens_explicit = true;
+        } else if (arg == "--device-index") {
+            // Vulkan exposes every GPU in the box, and the GGML scheduler picks
+            // the first one it sees — on a mixed NVIDIA/AMD machine that is not
+            // necessarily the card you meant. Setting the visibility list before
+            // any backend initializes pins the choice. CUDA_VISIBLE_DEVICES is
+            // set too so the flag means the same thing on a CUDA build.
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing device-index value\n");
+                return 1;
+            }
+            const std::string index = argv[i];
+            setenv("GGML_VK_VISIBLE_DEVICES", index.c_str(), 1);
+            setenv("CUDA_VISIBLE_DEVICES", index.c_str(), 1);
+            device_index_arg = index;
+        } else if (arg == "--list-devices") {
+            list_devices = true;
         } else if (arg == "--repetition-penalty") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing repetition-penalty value\n");
@@ -314,10 +338,49 @@ int main(int argc, char ** argv) {
     }
     
     // Validate required arguments
-    if (model_dir.empty()) {
+    if (model_dir.empty() && !list_devices) {
         fprintf(stderr, "Error: model directory is required\n");
         print_usage(argv[0]);
         return 1;
+    }
+
+    if (list_devices) {
+        // Print the devices GGML can see, in the order the visiblity list uses,
+        // so --device-index can be chosen without guessing.
+        const size_t device_count = ggml_backend_dev_count();
+        if (device_count == 0) {
+            fprintf(stderr, "No GGML devices reported.\n");
+            return 1;
+        }
+        printf("GGML devices (%zu):\n", device_count);
+        for (size_t i = 0; i < device_count; ++i) {
+            ggml_backend_dev_t device = ggml_backend_dev_get(i);
+            const char * name = device ? ggml_backend_dev_name(device) : "unknown";
+            const char * description = device ? ggml_backend_dev_description(device) : "";
+            printf("  [%zu] %s%s%s\n", i, name ? name : "unknown",
+                   (description && description[0]) ? " - " : "",
+                   (description && description[0]) ? description : "");
+        }
+        if (!device_index_arg.empty()) {
+            printf("Pinned with --device-index %s (GGML_VK_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES).\n",
+                   device_index_arg.c_str());
+        }
+        return 0;
+    }
+
+    // Bound generation by the input length unless the caller asked for something
+    // specific. The pipeline default is 2048 frames (~164s of audio at 12.5
+    // frames/s), and a degenerate decode really does run to that cap — measured
+    // here as 163.8s of audio for a 44-character sentence. This model speaks at
+    // roughly 12-17 characters per second, i.e. frames ≈ characters, so allow
+    // twice the expected frame count and never exceed the old default.
+    if (!max_tokens_explicit && !text.empty()) {
+        const int derived = 2 * (int)text.size();
+        params.max_audio_tokens = std::min(2048, std::max(64, derived));
+        if (!quiet_progress) {
+            fprintf(stderr, "  Generation cap: %d frames (derived from %zu chars; --max-tokens overrides)\n",
+                    params.max_audio_tokens, text.size());
+        }
     }
 
     if (text.empty() && !list_speakers) {
