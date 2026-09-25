@@ -22,6 +22,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from icl_cache import IclPromptCache, build_icl_prompt_cache_key
+from generation_limits import derive_max_audio_tokens
 from qwen3_tts_binding import QwenTTS
 
 # ---------------------------------------------------------------------------
@@ -60,11 +61,7 @@ MAX_AUDIO_TOKENS = int(os.environ.get("QWEN3TTS_MAX_AUDIO_TOKENS", "0"))
 
 def resolve_max_audio_tokens(text: str) -> int:
     """Bound generation by the input length unless a fixed cap was configured."""
-    if MAX_AUDIO_TOKENS > 0:
-        return MAX_AUDIO_TOKENS
-    # This model speaks at roughly 12-17 characters per second and the tokenizer
-    # emits 12.5 frames per second, so frames ~= characters. Allow 2x for headroom.
-    return min(2048, max(64, 2 * len(text.strip())))
+    return derive_max_audio_tokens(text, MAX_AUDIO_TOKENS)
 
 
 
